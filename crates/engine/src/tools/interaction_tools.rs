@@ -368,6 +368,8 @@ pub fn decide(ws: Option<&Workspace>, tool: &str, input: &Value) -> Decision {
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "edit-outside".to_string(),
         "Bash" => format!("bash:{}", s("command").split_whitespace().next().unwrap_or_default()),
         "WebFetch" | "WebSearch" => "web".to_string(),
+        "OpenBitFunPublish" => "publish".to_string(),
+        "OpenBitFunDelete" => "delete_outside".to_string(),
         other => other.to_string(),
     };
     let app = ws.map(Workspace::app_dir);
@@ -399,6 +401,9 @@ pub fn decide(ws: Option<&Workspace>, tool: &str, input: &Value) -> Decision {
         // project chose otherwise (`ActionKind::Web`).
         "WebFetch" => Decision::Ask { title: format!("Read a web page: {}", s("url")), kind },
         "WebSearch" => Decision::Ask { title: format!("Search the web: {}", s("query")), kind },
+        "OpenBitFunPublish" => Decision::Ask { title: format!("Publish or deploy through OpenBitFun: {}", s("permission_title")), kind },
+        "OpenBitFunDelete" => Decision::Ask { title: format!("Delete through OpenBitFun: {}", s("permission_title")), kind },
+        other if other.starts_with("OpenBitFun") => Decision::Ask { title: format!("OpenBitFun operation: {}", s("permission_title")), kind },
         other => Decision::Ask { title: format!("Use {other}"), kind },
     }
 }
@@ -504,6 +509,10 @@ const OFF_LIMITS: &str = "Clean room: the original (its files, its folder, its p
 /// that would read, list, change or run anything in a local target's folder (the project's own
 /// folder excepted), or fetch a website target's pages.
 pub fn off_limits(ws: Option<&Workspace>, tool: &str, input: &Value) -> Option<String> {
+    // OpenBitFun operations without a target-aware Clean Room rule must not reach the original.
+    if tool.starts_with("OpenBitFun") {
+        return Some(OFF_LIMITS.into());
+    }
     let ws = ws?;
     let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     let refused = match &ws.manifest.target {
@@ -586,6 +595,8 @@ pub fn kind_of(ws: Option<&Workspace>, tool: &str, input: &Value) -> ActionKind 
         }
         "Bash" | "PowerShell" => kinds_of(ws, tool, input).first().copied().unwrap_or(ActionKind::Commands),
         "WebFetch" | "WebSearch" => ActionKind::Web,
+        "OpenBitFunPublish" => ActionKind::Publish,
+        "OpenBitFunDelete" => ActionKind::DeleteOutside,
         _ => ActionKind::OtherTools,
     }
 }
@@ -960,6 +971,27 @@ mod tests {
         assert!(off_limits(Some(&site), "Bash", &json!({"command": "curl -s https://example.com/robots.txt"})).is_some());
         assert!(off_limits(Some(&site), "Bash", &json!({"command": "npm run build"})).is_none());
         assert_eq!((host_of("https://user@Shop.Test:8443/a"), host_of("not a url")), (Some("shop.test".into()), None));
+    }
+
+    #[test]
+    fn openbitfun_actions_use_existing_approval_categories_and_respect_clean_room() {
+        let (_dir, workspace) = ws();
+        let cases = [("OpenBitFunOther", ActionKind::OtherTools), ("OpenBitFunDelete", ActionKind::DeleteOutside), ("OpenBitFunPublish", ActionKind::Publish)];
+
+        for (tool, expected_kind) in cases {
+            let input = json!({
+                "permission_title": "OpenBitFun test action",
+                "resources": ["target/resource"]
+            });
+
+            assert!(matches!(decide(Some(&workspace), tool, &input), Decision::Ask { .. }), "{tool} must enter the approval path in manual mode");
+            assert_eq!(kind_of(Some(&workspace), tool, &input), expected_kind, "{tool}");
+            assert!(never_unasked(Some(&workspace), tool, &input).is_some(), "{tool} must not be silently allowed in Auto mode");
+
+            let clean_room_result = approve_with(Some(Inbox::new(workspace.inbox_dir())), true, true, tool, &input, &|| false, &mut || {}).unwrap();
+
+            assert!(clean_room_result.is_err(), "{tool} must be refused in Clean Room");
+        }
     }
 
     #[test]

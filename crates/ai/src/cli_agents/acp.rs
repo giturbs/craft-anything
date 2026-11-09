@@ -33,6 +33,7 @@ pub const ACP_AGENTS: &[(&str, &[&str])] = &[
     ("copilot", &["--acp", "--stdio"]),
     // Flags that belong to this mode (`--model`, `--no-leader`) go between `agent` and `stdio`.
     ("grok", &["agent"]),
+    ("openbitfun", &["acp"]),
 ];
 
 /// Agents whose ACP mode takes the backend's model (`cli_model`), and the flag after the ACP
@@ -83,7 +84,7 @@ pub type Approver = Arc<dyn Fn(&str, &Value) -> bool + Send + Sync>;
 /// our tool server limits itself) is allowed. There is no project to check paths against in a chat,
 /// so nothing of the agent's own is let through.
 pub fn clean_room_chat_approver() -> Approver {
-    Arc::new(|tool, _input| !matches!(tool, "Read" | "Write" | "Bash" | "WebFetch"))
+    Arc::new(|tool, _input| !matches!(tool, "Read" | "Write" | "Bash" | "WebFetch") && !tool.starts_with("OpenBitFun"))
 }
 
 /// Session metadata only: no prompt is sent to discover a model's selectable settings.
@@ -95,6 +96,41 @@ pub struct ModelMetadata {
 
 /// An ACP tool call in the approval policy's shape.
 fn policy_action(call: &Value) -> (String, Value) {
+    // OpenBitFun carries its authoritative permission category and resources in rawInput.
+    // Normalize only well-understood single-resource operations; preserve all native metadata.
+    if let Some(raw_input) = call.get("rawInput") {
+        if let Some(action) = raw_input.get("action").and_then(Value::as_str) {
+            let action = action.to_ascii_lowercase();
+            let mut input = raw_input.as_object().cloned().unwrap_or_default();
+            let title = call.get("title").and_then(Value::as_str).unwrap_or("OpenBitFun permission");
+            input.insert("permission_title".into(), json!(title));
+
+            let resource = raw_input.get("resources").and_then(Value::as_array).and_then(|resources| {
+                if resources.len() == 1 { resources[0].as_str().map(str::to_string).filter(|value| !value.trim().is_empty()) } else { None }
+            });
+
+            let with_resource = |key: &str, value: &str| {
+                let mut normalized = input.clone();
+                normalized.insert(key.to_string(), json!(value));
+                Value::Object(normalized)
+            };
+
+            return match action.as_str() {
+                "read" => {
+                    resource.map(|path| ("Read".into(), with_resource("file_path", &path))).unwrap_or_else(|| ("OpenBitFunOther".into(), Value::Object(input)))
+                }
+                "edit" | "write" => {
+                    resource.map(|path| ("Write".into(), with_resource("file_path", &path))).unwrap_or_else(|| ("OpenBitFunOther".into(), Value::Object(input)))
+                }
+                "bash" => resource
+                    .map(|command| ("Bash".into(), with_resource("command", &command)))
+                    .unwrap_or_else(|| ("OpenBitFunOther".into(), Value::Object(input))),
+                "delete" => ("OpenBitFunDelete".into(), Value::Object(input)),
+                "page_deploy" | "page_publish" => ("OpenBitFunPublish".into(), Value::Object(input)),
+                _ => ("OpenBitFunOther".into(), Value::Object(input)),
+            };
+        }
+    }
     let s = |p: &str| call.pointer(p).and_then(Value::as_str).map(str::to_string);
     let path =
         s("/locations/0/path").or_else(|| s("/rawInput/path")).or_else(|| s("/rawInput/file_path")).or_else(|| s("/rawInput/abs_path")).unwrap_or_default();
@@ -1242,6 +1278,58 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$prompt
         let refused = sent(&c.line(r#"{"jsonrpc":"2.0","id":9,"method":"fs/read_text_file","params":{"path":"/etc/passwd"}}"#));
         assert_eq!(refused[0]["error"]["code"], -32601);
         assert!(c.line("not json").is_empty());
+    }
+
+    #[test]
+    fn openbitfun_permissions_keep_native_metadata_and_use_craft_policy_categories() {
+        let (tool, input) = policy_action(&json!({
+            "title": "Read project file",
+            "rawInput": {
+                "action": "read",
+                "resources": ["C:/target/src/main.rs"],
+                "saveResources": ["C:/target/**"],
+                "source": {"kind": "tool_call", "identity": "read_file"},
+                "displayMetadata": {"reason": "inspect source"}
+            }
+        }));
+        assert_eq!(tool, "Read");
+        assert_eq!(input["file_path"], "C:/target/src/main.rs");
+        assert_eq!(input["saveResources"], json!(["C:/target/**"]));
+        assert_eq!(input["source"]["identity"], "read_file");
+        assert_eq!(input["displayMetadata"]["reason"], "inspect source");
+
+        let (tool, input) = policy_action(&json!({
+            "title": "Run build command",
+            "rawInput": {"action": "bash", "resources": ["npm run build"]}
+        }));
+        assert_eq!(tool, "Bash");
+        assert_eq!(input["command"], "npm run build");
+
+        let (tool, _) = policy_action(&json!({
+            "title": "Delete resource",
+            "rawInput": {"action": "delete", "resources": ["C:/target/old.txt"]}
+        }));
+        assert_eq!(tool, "OpenBitFunDelete");
+
+        let (tool, _) = policy_action(&json!({
+            "title": "Publish deployment",
+            "rawInput": {"action": "page_publish", "resources": ["production"]}
+        }));
+        assert_eq!(tool, "OpenBitFunPublish");
+
+        for raw_input in [
+            json!({"action": "mcp", "resources": ["github:search_repos"]}),
+            json!({"action": "read", "resources": ["a.txt", "b.txt"]}),
+            json!({"action": "computer_use", "resources": ["open_app:Visual Studio Code"]}),
+        ] {
+            let (tool, input) = policy_action(&json!({
+                "title": "Other operation",
+                "rawInput": raw_input
+            }));
+            assert_eq!(tool, "OpenBitFunOther");
+            assert!(input.get("action").is_some());
+            assert!(input.get("resources").is_some());
+        }
     }
 
     #[test]
